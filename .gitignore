@@ -1,0 +1,17 @@
+# --- Python & System ---
+__pycache__/
+*.py[cod]
+.venv/
+.DS_Store
+
+# --- Project Data (NEVER upload these) ---
+# Ignore raw data folder containing heavy .npy files
+data/
+
+# --- Outputs ---
+# Ignore saved models (too heavy for standard GitHub)
+outputs/models/
+
+# KEEP plots and logs (required for README display)
+!outputs/plots/
+!outputs/logs/
