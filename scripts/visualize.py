@@ -1,185 +1,138 @@
 import sys
+import warnings
 import os
+
+# --- SILENCE ALL WARNINGS (Must be first) ---
+warnings.filterwarnings("ignore")
+os.environ["PYTHONWARNINGS"] = "ignore"
+# --------------------------------------------
+
 import json
-import matplotlib.pyplot as plt
-import seaborn as sns
 import pandas as pd
 import numpy as np
 import torch
-from tqdm import tqdm
+import matplotlib.pyplot as plt
+import seaborn as sns
+from pathlib import Path
 from sklearn.metrics import roc_curve, roc_auc_score, confusion_matrix
 from nnAudio.Spectrogram import CQT1992v2
 
-# Add project root to path
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from src.config import CFG
+sys.path.append(str(Path(__file__).parent.parent))
+from src.config import CFG, OUTPUT_DIR
 from src.dataset import G2NetDataset
+from src.utils import set_seed
 
-# ==============================================================================
-# 1. Spectrogram Analysis (Balanced Version)
-# ==============================================================================
-def find_loudest_signals(ds, cqt_layer, limit=500):
-    """
-    Scans for the strongest signals to ensure we plot visible chirps.
-    """
-    print(f"[INFO] Scanning first {limit} positive files to find strong signals...")
-    
-    pos_indices = np.where(ds.labels == 1)[0]
-    scan_indices = pos_indices[:limit]
-    
-    scores = []
-    
-    for idx in tqdm(scan_indices, desc="Hunting for Chirps"):
-        wave, _ = ds[idx]
-        with torch.no_grad():
-            wave_tensor = wave.unsqueeze(0).to(CFG.device)
-            spec = cqt_layer(wave_tensor.view(1*3, -1))
-            img = (spec[0] + spec[1] + spec[2]).cpu().numpy()
-            
-            img = np.log1p(img)
-            img = img - np.median(img, axis=1, keepdims=True)
-            
-            # Score based on peak intensity
-            score = np.max(img)
-            scores.append((score, idx))
-    
-    scores.sort(key=lambda x: x[0], reverse=True)
-    best_indices = [x[1] for x in scores[:2]]
-    
-    print(f"[SUCCESS] Found strongest candidates at indices: {best_indices}")
-    return best_indices
+# Plot Config
+sns.set_style("white")
+plt.rcParams['axes.spines.right'] = False
+plt.rcParams['axes.spines.top'] = False
+plt.rcParams['axes.grid'] = False
 
-def plot_spectrogram():
-    print("[INFO] Generating Balanced Spectrogram (Standard Res + Texture)...")
-    
-    if not os.path.exists(CFG.SUBSET_CSV):
-        df_full = pd.read_csv(CFG.LABELS_CSV)
-        df = df_full.sample(n=60000, random_state=CFG.seed).reset_index(drop=True)
-        df.to_csv(CFG.SUBSET_CSV, index=False)
-    else:
-        df = pd.read_csv(CFG.SUBSET_CSV)
-
-    ds = G2NetDataset(df)
-    
-    # BACK TO STANDARD RESOLUTION (bins_per_octave=12)
-    # This creates the "blocky" look that makes the signal pop visually.
-    cqt_layer = CQT1992v2(
-        sr=CFG.sr, fmin=CFG.fmin, fmax=500, hop_length=32, 
-        bins_per_octave=12, 
-        output_format="Magnitude", verbose=False
-    ).to(CFG.device)
-
-    # Find the loud signals
-    indices = find_loudest_signals(ds, cqt_layer)
-
-    # Plot Setup
-    fig, axes = plt.subplots(1, 2, figsize=(20, 7))
-    plt.subplots_adjust(right=0.9, top=0.85)
-
-    for i, idx in enumerate(indices):
-        wave, target = ds[idx]
-        file_id = ds.file_names[idx]
-        
-        with torch.no_grad():
-            wave_tensor = wave.unsqueeze(0).to(CFG.device)
-            spec = cqt_layer(wave_tensor.view(1*3, -1))
-            img = (spec[0] + spec[1] + spec[2]).cpu().numpy()
-
-        # --- BALANCED PIPELINE ---
-        
-        # 1. Log Scale
-        img = np.log1p(img)
-        
-        # 2. Median Subtraction (Cleaner background)
-        img = img - np.median(img, axis=1, keepdims=True)
-        
-        # 3. Min-Max Normalization
-        img = (img - np.min(img)) / (np.max(img) - np.min(img))
-        
-        # 4. THRESHOLD ADJUSTMENT
-        # lowered from 0.60 to 0.45.
-        # This keeps the signal bright but allows some background "dust" to appear,
-        # making it look less "fake/empty".
-        img[img < 0.45] = 0 
-
-        # Plot
-        ax = axes[i]
-        im = ax.imshow(img, aspect='auto', origin='lower', cmap='inferno', interpolation='bicubic')
-        
-        ax.set_title(f"ID: {file_id}\nStrong Chirp (Target=1)", fontsize=16, fontweight='bold')
-        ax.set_xlabel("Time steps")
-        ax.set_ylabel("Frequency")
-        ax.grid(False)
-        ax.set_xticks([])
-        ax.set_yticks([])
-
-    cbar_ax = fig.add_axes([0.92, 0.15, 0.02, 0.7])
-    fig.colorbar(im, cax=cbar_ax).set_label('Normalized Amplitude (Threshold > 0.45)', fontsize=12)
-    
-    plt.suptitle("Gravitational Wave Signal Reconstruction", fontsize=22, y=1.05)
-    
-    output_path = os.path.join(CFG.PLOTS_DIR, "spectrogram.png")
-    plt.savefig(output_path, bbox_inches='tight')
-    plt.close()
-    print(f"[SUCCESS] Spectrogram saved to {output_path}")
-
-# ==============================================================================
-# 2. Training Grid
-# ==============================================================================
-def plot_grid():
-    log_file = os.path.join(CFG.LOGS_DIR, "training_history.json")
-    if not os.path.exists(log_file): return
-
-    with open(log_file, 'r') as f: histories = json.load(f)
+def plot_grid_results(histories):
     n_folds = len(histories)
     epochs = range(1, len(histories[0]['t_loss']) + 1)
     colors = sns.color_palette("husl", n_folds)
-    
-    sns.set_style("white"); plt.rcParams['axes.spines.right'] = False; plt.rcParams['axes.spines.top'] = False
     fig, axes = plt.subplots(2, n_folds, figsize=(20, 8), sharex=True)
-    fig.text(0.125, 1.02, 'Cross-Validation Results', fontsize=28, fontweight='bold', ha='left')
-
+    fig.text(0.125, 1.02, 'Results per fold', fontsize=28, fontweight='bold', ha='left')
+    
     for i in range(n_folds):
-        h = histories[i]; c = colors[i]
-        axes[0, i].plot(epochs, h['t_loss'], color=c, marker='o', label='Train')
-        axes[0, i].plot(epochs, h['v_loss'], color='gray', marker='x', ls='--', label='Valid')
-        axes[0, i].set_title(f'Fold {i+1}', fontweight='bold')
-        if i==0: axes[0, i].set_ylabel('BCE Loss'); axes[0, i].legend()
+        h = histories[i]
+        c = colors[i]
+        ax_l = axes[0, i]
+        ax_l.plot(epochs, h['t_loss'], label='Train', color=c, marker='o', lw=2)
+        ax_l.plot(epochs, h['v_loss'], label='Valid', color='gray', marker='x', ls='--', lw=1.5)
+        ax_l.set_title(f'Loss: Fold {i+1}', fontsize=14, fontweight='bold')
+        if i == 0: ax_l.set_ylabel('BCE Loss', fontsize=12)
         
-        axes[1, i].plot(epochs, h['t_auc'], color=c, marker='o', label='Train')
-        axes[1, i].plot(epochs, h['v_auc'], color='dimgray', marker='s', label='Valid')
-        if i==0: axes[1, i].set_ylabel('AUC Score')
-        axes[1, i].set_xlabel('Epoch')
+        ax_a = axes[1, i]
+        ax_a.plot(epochs, h['t_auc'], label='Train AUC', color=c, marker='o', lw=2)
+        ax_a.plot(epochs, h['v_auc'], label='Valid AUC', color='dimgray', marker='s', lw=2)
+        if i == 0: ax_a.set_ylabel('AUC Score', fontsize=12)
+        ax_a.set_xlabel('Epoch', fontsize=12)
+    
+    plt.tight_layout()
+    plt.savefig(OUTPUT_DIR / "plots" / "training_grid.png", bbox_inches='tight')
+    print("Saved training_grid.png")
 
-    plt.tight_layout(); plt.savefig(os.path.join(CFG.PLOTS_DIR, "training_grid.png"), bbox_inches='tight'); plt.close()
+def plot_candidates_hd(device):
+    # To reproduce this, we need to load the dataset again
+    df = pd.read_csv(CFG.train_csv)
+    # We don't need the split here, just finding the file in the full 60k is enough
+    # But to be safe on paths, let's just use the full dataset class
+    ds = G2NetDataset(df)
+    
+    target_ids = ['9c13c328bf', '3329ef4849']
+    found_indices = [i for i, fname in enumerate(ds.file_names) if fname in target_ids]
+    
+    if len(found_indices) < 2:
+        print("[WARN] Could not find specific target IDs for spectrogram plot (Data subset might be too small).")
+        return
 
-# ==============================================================================
-# 3. Metrics
-# ==============================================================================
-def plot_metrics():
-    csv_file = os.path.join(CFG.LOGS_DIR, "oof_predictions_b2.csv")
-    if not os.path.exists(csv_file): return
+    cqt_layer = CQT1992v2(sr=2048, fmin=20, fmax=500, hop_length=32, 
+                          bins_per_octave=12, output_format="Magnitude", 
+                          verbose=False).to(device)
 
-    df = pd.read_csv(csv_file)
-    y_true, y_pred = df['target'], df['pred_b2']
+    fig, axes = plt.subplots(1, 2, figsize=(20, 7))
+    plt.subplots_adjust(right=0.9, top=0.85)
 
-    plt.figure(figsize=(9, 7)); fpr, tpr, _ = roc_curve(y_true, y_pred); score = roc_auc_score(y_true, y_pred)
-    plt.plot(fpr, tpr, color='#8B0000', lw=3, label=f'AUC={score:.4f}')
-    plt.fill_between(fpr, tpr, color='#8B0000', alpha=0.1); plt.plot([0,1],[0,1], 'navy', ls='--'); plt.legend(loc='lower right')
-    plt.title('ROC Curve', fontsize=20, fontweight='bold'); plt.savefig(os.path.join(CFG.PLOTS_DIR, "roc_curve.png")); plt.close()
+    for i, idx in enumerate(found_indices):
+        wave, _ = ds[idx]
+        file_id = ds.file_names[idx]
+        wave_tensor = wave.unsqueeze(0).to(device)
+        with torch.no_grad():
+            spec = cqt_layer(wave_tensor.view(1*3, -1))
+            spec_np = spec.cpu().numpy()
+            img = spec_np[0] + spec_np[1]
+            img = np.log1p(img)
+            img = img - np.median(img, axis=1, keepdims=True)
+            img = (img - np.min(img)) / (np.max(img) - np.min(img) + 1e-7)
+            img[img < 0.60] = 0
 
-    y_pred_bin = (y_pred > 0.5).astype(int); cm = confusion_matrix(y_true, y_pred_bin); tn, fp, fn, tp = cm.ravel()
-    labels = np.asarray([f"TN\n{tn}", f"FP\n{fp}", f"FN\n{fn}", f"TP\n{tp}"]).reshape(2, 2)
-    plt.figure(figsize=(8, 7.5)); sns.heatmap(cm, annot=labels, fmt='', cmap='Blues', cbar=False, annot_kws={"size": 14, "weight":"bold"})
-    plt.title('Confusion Matrix', fontsize=18, fontweight='bold'); plt.subplots_adjust(bottom=0.25)
-    stats = f"Accuracy: {(tp+tn)/len(y_true):.4f}\nSensitivity: {tp/(tp+fn):.4f}\nSpecificity: {tn/(tn+fp):.4f}"
-    plt.figtext(0.5, 0.08, stats, ha="center", fontsize=14, bbox={"facecolor":"orange", "alpha":0.1, "pad":10})
-    plt.savefig(os.path.join(CFG.PLOTS_DIR, "confusion_matrix.png")); plt.close()
+            ax = axes[i]
+            im = ax.imshow(img, aspect='auto', origin='lower', cmap='inferno', interpolation='bicubic')
+            ax.set_title(f"ID: {file_id}\nSource: LIGO Hanford + Livingston", fontsize=16, fontweight='bold')
+            ax.set_xticks([]); ax.set_yticks([])
+
+    cbar_ax = fig.add_axes([0.92, 0.15, 0.02, 0.7])
+    cbar = fig.colorbar(im, cax=cbar_ax)
+    cbar.set_label('Normalized Amplitude (Threshold > 0.60)', fontsize=12)
+    plt.suptitle("Gravitational Wave Signal Reconstruction", fontsize=22)
+    plt.savefig(OUTPUT_DIR / "plots" / "spectrogram.png", bbox_inches='tight')
+    print("Saved spectrogram.png")
+
+def plot_roc_and_cm(csv_path):
+    df = pd.read_csv(csv_path)
+    y_true = df['target']
+    y_pred = df['pred_b2']
+    
+    # ROC
+    fpr, tpr, _ = roc_curve(y_true, y_pred)
+    score = roc_auc_score(y_true, y_pred)
+    plt.figure(figsize=(9, 7))
+    plt.plot(fpr, tpr, color='#8B0000', lw=3, label=f'AUC = {score:.4f}')
+    plt.fill_between(fpr, tpr, color='#8B0000', alpha=0.1)
+    plt.plot([0, 1], [0, 1], 'k--')
+    plt.title('ROC Curve', fontsize=20, fontweight='bold')
+    plt.legend(loc="lower right")
+    plt.savefig(OUTPUT_DIR / "plots" / "roc_curve.png")
+    print("Saved roc_curve.png")
+    
+    # CM
+    y_pred_bin = (y_pred > 0.5).astype(int)
+    cm = confusion_matrix(y_true, y_pred_bin)
+    plt.figure(figsize=(8, 7.5))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', cbar=False)
+    plt.title('Global Confusion Matrix', fontsize=18, fontweight='bold')
+    plt.savefig(OUTPUT_DIR / "plots" / "confusion_matrix.png")
+    print("Saved confusion_matrix.png")
 
 if __name__ == "__main__":
-    import warnings
-    warnings.filterwarnings("ignore")
-    plot_spectrogram()
-    plot_grid()
-    plot_metrics()
-    print(f"\n[DONE] All plots generated in {CFG.PLOTS_DIR}")
+    (OUTPUT_DIR / "plots").mkdir(parents=True, exist_ok=True)
+    
+    print("[INFO] Loading history...")
+    with open(OUTPUT_DIR / "logs" / "training_history.json", 'r') as f:
+        history = json.load(f)
+        
+    plot_grid_results(history)
+    plot_candidates_hd(CFG.device)
+    plot_roc_and_cm(OUTPUT_DIR / "logs" / "oof_predictions_b2.csv")

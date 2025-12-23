@@ -1,186 +1,168 @@
 import sys
-import os
-import json
 import warnings
+import os
 
-# --- SILENCER BLOCK (PULIZIA TERMINALE) ---
-# Ignora tutti i warning non critici per avere un output pulito
+# --- 1. SILENCE ALL WARNINGS (Must be first) ---
+warnings.filterwarnings("ignore")
 os.environ["PYTHONWARNINGS"] = "ignore"
-warnings.filterwarnings("ignore", category=UserWarning)
-warnings.filterwarnings("ignore", category=FutureWarning)
-warnings.filterwarnings("ignore", category=SyntaxWarning)
-warnings.filterwarnings("ignore", module="nnAudio")
-warnings.filterwarnings("ignore", module="torch")
-# ------------------------------------------
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+# -----------------------------------------------
 
-import numpy as np
+from pathlib import Path
+import json
 import pandas as pd
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import torch.cuda.amp as amp
+# import torch.cuda.amp as amp # Not used explicitly in new torch versions
 from torch.utils.data import DataLoader
 from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import roc_auc_score
 from tqdm import tqdm
 
-# Add project root to path for module imports
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from src.config import CFG
+# Add src to python path to allow imports
+sys.path.append(str(Path(__file__).parent.parent))
+
+from src.config import CFG, OUTPUT_DIR
+from src.utils import set_seed
 from src.dataset import G2NetDataset
 from src.model import G2NetModel
 
-def train_one_epoch(model, loader, criterion, optimizer, scaler, device):
-    """
-    Executes one training epoch with mixed precision.
-    """
+def train_epoch(train_loader, model, criterion, optimizer, scaler, device):
     model.train()
-    running_loss = 0.0
-    all_targets = []
-    all_preds = []
+    running_loss = 0
+    preds_list = []
+    labels_list = []
     
-    # Progress bar for training
-    pbar = tqdm(loader, desc="Training", leave=False)
+    # Clean progress bar
+    pbar = tqdm(train_loader, desc="Training", leave=False, bar_format='{l_bar}{bar:10}{r_bar}')
     
-    for waves, targets in pbar:
-        waves = waves.to(device)
-        targets = targets.to(device)
-        
+    for images, labels in pbar:
+        images, labels = images.to(device), labels.to(device)
         optimizer.zero_grad()
         
-        # Mixed Precision Forward Pass
-        # Su Mac CPU questo contesto non fa molto, ma lo lasciamo per compatibilità codice
-        with amp.autocast(enabled=(device.type == 'cuda')):
-            outputs = model(waves).squeeze(1)
-            loss = criterion(outputs, targets)
-        
-        # Backward Pass with Scaler
-        scaler.scale(loss).backward()
-        scaler.step(optimizer)
-        scaler.update()
+        # CPU/MPS friendly AMP check
+        if device.type == 'cuda':
+            with torch.amp.autocast('cuda'):
+                outputs = model(images).squeeze(1)
+                loss = criterion(outputs, labels)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            # Standard precision for CPU/MPS (avoids warnings)
+            outputs = model(images).squeeze(1)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
         
         running_loss += loss.item()
-        
-        # Store metrics
-        all_targets.extend(targets.detach().cpu().numpy())
-        all_preds.extend(torch.sigmoid(outputs).detach().cpu().numpy())
-        
-        # Update progress bar
+        preds_list.append(torch.sigmoid(outputs).detach().cpu().numpy())
+        labels_list.append(labels.detach().cpu().numpy())
         pbar.set_postfix(loss=f"{loss.item():.4f}")
         
-    epoch_loss = running_loss / len(loader)
-    try:
-        epoch_auc = roc_auc_score(all_targets, all_preds)
-    except ValueError:
-        epoch_auc = 0.5 # Fallback se batch troppo piccolo o classe unica
-    
-    return epoch_loss, epoch_auc
+    all_preds = np.concatenate(preds_list)
+    all_labels = np.concatenate(labels_list)
+    return running_loss/len(train_loader), roc_auc_score(all_labels, all_preds)
 
-def valid_one_epoch(model, loader, criterion, device):
-    """
-    Executes validation phase (inference only).
-    """
+def validate_epoch(valid_loader, model, criterion, device):
     model.eval()
-    running_loss = 0.0
-    all_targets = []
-    all_preds = []
+    running_loss = 0
+    preds_list = []
+    labels_list = []
     
     with torch.no_grad():
-        for waves, targets in tqdm(loader, desc="Validation", leave=False):
-            waves = waves.to(device)
-            targets = targets.to(device)
-            
-            outputs = model(waves).squeeze(1)
-            loss = criterion(outputs, targets)
-            
+        for images, labels in tqdm(valid_loader, desc="Validation", leave=False):
+            images, labels = images.to(device), labels.to(device)
+            outputs = model(images).squeeze(1)
+            loss = criterion(outputs, labels)
             running_loss += loss.item()
-            all_targets.extend(targets.cpu().numpy())
-            all_preds.extend(torch.sigmoid(outputs).cpu().numpy())
+            preds_list.append(torch.sigmoid(outputs).cpu().numpy())
+            labels_list.append(labels.cpu().numpy())
             
-    epoch_loss = running_loss / len(loader)
-    try:
-        epoch_auc = roc_auc_score(all_targets, all_preds)
-    except ValueError:
-        epoch_auc = 0.5
-    
-    return epoch_loss, epoch_auc, np.array(all_preds)
+    all_preds = np.concatenate(preds_list)
+    all_labels = np.concatenate(labels_list)
+    return running_loss/len(valid_loader), roc_auc_score(all_labels, all_preds), all_preds, all_labels
 
-def main():
-    # Force clean output
-    print(f"\n[INFO] Starting Training Pipeline on device: {CFG.device}")
+if __name__ == '__main__':
+    # --- DATA AVAILABILITY CHECK ---
+    if not CFG.train_data_dir.exists() or not any(CFG.train_data_dir.iterdir()):
+        print("\n[ERROR] Data not found in 'data/raw/train/'.")
+        print("Please download the dataset from the Google Drive link in the README.")
+        print("Extract the 'train' folder so it sits inside 'data/raw/'.\n")
+        sys.exit(1)
+    # -------------------------------
+
+    # Ensure outputs exist
+    (OUTPUT_DIR / "logs").mkdir(parents=True, exist_ok=True)
+    (OUTPUT_DIR / "models").mkdir(parents=True, exist_ok=True)
+
+    set_seed(CFG.seed)
+    print(f"[INFO] Local Training: EfficientNet-B2 | Epochs: {CFG.epochs} | Device: {CFG.device}")
     
-    # 1. Prepare Data Subset if not exists
-    if not os.path.exists(CFG.SUBSET_CSV):
-        print(f"[INFO] Generating subset CSV ({CFG.subset_size} samples)...")
-        if not os.path.exists(CFG.LABELS_CSV):
-            print(f"[ERROR] Labels file not found at {CFG.LABELS_CSV}")
-            return
-            
-        df = pd.read_csv(CFG.LABELS_CSV)
-        # Random sample with fixed seed for reproducibility
-        df_subset = df.sample(n=CFG.subset_size, random_state=CFG.seed).reset_index(drop=True)
-        df_subset.to_csv(CFG.SUBSET_CSV, index=False)
-    else:
-        df_subset = pd.read_csv(CFG.SUBSET_CSV)
+    df = pd.read_csv(CFG.train_csv)
+    df_subset = df.sample(n=CFG.subset_size, random_state=CFG.seed).reset_index(drop=True)
     
-    # 2. Cross-Validation Setup
     skf = StratifiedKFold(n_splits=CFG.n_fold, shuffle=True, random_state=CFG.seed)
-    full_history = []
+    oof_df = df_subset.copy()
+    oof_df['pred_b2'] = 0.0
     
-    # Eseguiamo solo il primo fold per il test
+    history_data = []
+
+    # Check if we should pin memory (Only True if using CUDA)
+    use_pin_memory = (CFG.device.type == 'cuda')
+
     for fold, (train_idx, val_idx) in enumerate(skf.split(df_subset, df_subset['target'])):
-        print(f"\n{'='*20} FOLD {fold+1}/{CFG.n_fold} {'='*20}")
+        print(f"\n=== FOLD {fold+1}/{CFG.n_fold} ===")
         
-        # Data Loaders
         train_ds = G2NetDataset(df_subset.iloc[train_idx].reset_index(drop=True))
         valid_ds = G2NetDataset(df_subset.iloc[val_idx].reset_index(drop=True))
         
-        # NOTE: pin_memory=False removes the MPS warning on Mac
-        train_loader = DataLoader(
-            train_ds, 
-            batch_size=CFG.batch_size, 
-            shuffle=True, 
-            num_workers=CFG.num_workers,
-            pin_memory=False 
-        )
-        valid_loader = DataLoader(
-            valid_ds, 
-            batch_size=CFG.batch_size, 
-            shuffle=False, 
-            num_workers=CFG.num_workers,
-            pin_memory=False
-        )
+        # FIXED: Dynamic pin_memory
+        train_loader = DataLoader(train_ds, batch_size=CFG.batch_size, shuffle=True, 
+                                num_workers=CFG.num_workers, pin_memory=use_pin_memory)
+        valid_loader = DataLoader(valid_ds, batch_size=CFG.batch_size, shuffle=False, 
+                                num_workers=CFG.num_workers, pin_memory=use_pin_memory)
         
-        # Model Initialization
-        model = G2NetModel(CFG).to(CFG.device)
+        model = G2NetModel().to(CFG.device)
         optimizer = optim.AdamW(model.parameters(), lr=CFG.lr, weight_decay=CFG.weight_decay)
-        criterion = nn.BCEWithLogitsLoss()
-        scaler = amp.GradScaler(enabled=(CFG.device.type == 'cuda'))
+        
+        # Scaler is only needed for CUDA
+        scaler = torch.amp.GradScaler('cuda', enabled=(CFG.device.type == 'cuda'))
+        
+        scheduler = optim.lr_scheduler.OneCycleLR(optimizer, max_lr=CFG.lr, 
+                                                steps_per_epoch=len(train_loader), epochs=CFG.epochs)
         
         fold_history = {'t_loss': [], 'v_loss': [], 't_auc': [], 'v_auc': []}
+        best_auc = 0
+        best_preds = None
         
-        # Epoch Loop
         for epoch in range(CFG.epochs):
-            t_loss, t_auc = train_one_epoch(model, train_loader, criterion, optimizer, scaler, CFG.device)
-            v_loss, v_auc, _ = valid_one_epoch(model, valid_loader, criterion, CFG.device)
+            t_loss, t_auc = train_epoch(train_loader, model, nn.BCEWithLogitsLoss(), optimizer, scaler, CFG.device)
+            v_loss, v_auc, v_preds, _ = validate_epoch(valid_loader, model, nn.BCEWithLogitsLoss(), CFG.device)
             
-            print(f"Epoch {epoch+1}/{CFG.epochs} | "
-                  f"Train Loss: {t_loss:.4f} AUC: {t_auc:.4f} | "
-                  f"Valid Loss: {v_loss:.4f} AUC: {v_auc:.4f}")
-            
-            # Record metrics
             fold_history['t_loss'].append(t_loss)
             fold_history['v_loss'].append(v_loss)
             fold_history['t_auc'].append(t_auc)
             fold_history['v_auc'].append(v_auc)
             
-        full_history.append(fold_history)
-        
-        # Save logs checkpoint
-        with open(os.path.join(CFG.LOGS_DIR, "training_history.json"), "w") as f:
-            json.dump(full_history, f, indent=4)
+            print(f"Ep {epoch+1}/{CFG.epochs} | Loss: {t_loss:.4f}/{v_loss:.4f} | AUC: {t_auc:.4f}/{v_auc:.4f}")
             
-    print("\n[SUCCESS] Training complete. Logs saved.")
+            if v_auc > best_auc:
+                best_auc = v_auc
+                best_preds = v_preds
+            scheduler.step()
+            
+        oof_df.loc[val_idx, 'pred_b2'] = best_preds
+        history_data.append(fold_history)
+        
+        # Optional: Save Model
+        torch.save(model.state_dict(), OUTPUT_DIR / "models" / f"model_fold_{fold+1}.pth")
 
-if __name__ == "__main__":
-    main()
+    print("\n[INFO] Saving Results...")
+    oof_df.to_csv(OUTPUT_DIR / "logs" / "oof_predictions_b2.csv", index=False)
+    with open(OUTPUT_DIR / "logs" / "training_history.json", 'w') as f:
+        json.dump(history_data, f)
+    
+    print("Done. Run scripts/visualize.py to generate plots.")
