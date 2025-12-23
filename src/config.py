@@ -6,7 +6,7 @@ PROJECT_ROOT = Path(__file__).parent.parent
 DATA_DIR = PROJECT_ROOT / "data" / "raw"
 OUTPUT_DIR = PROJECT_ROOT / "outputs"
 
-# --- TOGGLE THIS TO 'True' FOR A FAST TEST RUN ---
+# --- TOGGLE THIS TO 'False' FOR THE FULL TRAINING ---
 DEBUG = True 
 # -------------------------------------------------
 
